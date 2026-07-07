@@ -1,0 +1,197 @@
+name: Biji
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: macos-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure macOS Remote Access
+        run: |
+          # Enable Screen Sharing via launchctl (works on GitHub Actions)
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          
+          # Set VNC password menggunakan method yang kompatibel
+          sudo defaults write /Library/Preferences/com.apple.VNCSettings VNCAlwaysStartOnConsole -bool true
+          sudo defaults write /Library/Preferences/com.apple.VNCSettings VNCSecurityTypes -array "VNCSecurityTypeNone"
+          
+          # Enable SSH
+          sudo systemsetup -setremotelogin on
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
+          
+          # Create ARD (Apple Remote Desktop) group if not exists
+          sudo dseditgroup -o create -q com.apple.access_ard
+          sudo dseditgroup -o edit -a admin -t group com.apple.access_ard
+          
+          # Enable VNC without password untuk testing
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate \
+            -configure \
+            -access -on \
+            -allowAccessFor -allUsers \
+            -privs -all \
+            -clientopts \
+            -setvnclegacy -vnclegacy yes \
+            -setvncpw -vncpw "TempVNC123!" \
+            -restart -agent
+          
+          # Open firewall ports
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/ARDSAgent
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/sbin/sshd
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/ARDSAgent
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /usr/sbin/sshd
+
+      - name: Create Access User with Random Username
+        run: |
+          # Generate random 4-digit number
+          randomNum=$(( RANDOM % 9000 + 1000 ))
+          username="Marno${randomNum}"
+          
+          # Store username in environment variable
+          echo "RDP_USERNAME=${username}" >> $GITHUB_ENV
+          
+          # Generate secure password
+          password=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+          echo "RDP_PASSWORD=${password}" >> $GITHUB_ENV
+          
+          # Create user dengan UID unik
+          maxUID=$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)
+          newUID=$((maxUID + 1))
+          
+          sudo dscl . -create /Users/${username}
+          sudo dscl . -create /Users/${username} UserShell /bin/bash
+          sudo dscl . -create /Users/${username} RealName "${username}"
+          sudo dscl . -create /Users/${username} UniqueID ${newUID}
+          sudo dscl . -create /Users/${username} PrimaryGroupID 20
+          sudo dscl . -create /Users/${username} NFSHomeDirectory /Users/${username}
+          sudo dscl . -passwd /Users/${username} "${password}"
+          
+          # Create home directory
+          sudo mkdir -p /Users/${username}
+          sudo chown -R ${newUID}:20 /Users/${username}
+          
+          # Grant admin privileges
+          sudo dscl . -append /Groups/admin GroupMembership ${username}
+          
+          # Add to ARD access group
+          sudo dseditgroup -o edit -a ${username} -t user com.apple.access_ard
+          
+          # Auto-login untuk user (diperlukan untuk VNC session)
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser ${username}
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserUID ${newUID}
+          
+          # Verify user creation
+          if ! id ${username} &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+          
+          echo "User ${username} created successfully"
+
+      - name: Install Tailscale
+        run: |
+          # Download Tailscale untuk macOS
+          curl -fsSL https://pkgs.tailscale.com/stable/tailscale-setup-latest-macos.pkg -o /tmp/tailscale.pkg
+          sudo installer -pkg /tmp/tailscale.pkg -target /
+          rm -f /tmp/tailscale.pkg
+          
+          # Verifikasi instalasi
+          if [ -f "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+              echo "Tailscale installed successfully"
+          else
+              echo "Tailscale installation failed"
+              exit 1
+          fi
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Start Tailscale dengan auth key
+          sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-${GITHUB_RUN_ID}
+          
+          # Wait for Tailscale IP
+          tsIP=""
+          retries=0
+          while [ -z "$tsIP" ] && [ $retries -lt 15 ]; do
+              sleep 5
+              tsIP=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 2>/dev/null)
+              retries=$((retries + 1))
+              echo "Attempt $retries: Waiting for Tailscale IP..."
+          done
+          
+          if [ -z "$tsIP" ]; then
+              echo "Failed to get Tailscale IP"
+              exit 1
+          fi
+          
+          echo "TAILSCALE_IP=${tsIP}" >> $GITHUB_ENV
+          echo "Tailscale IP: ${tsIP}"
+          
+          # Get Tailscale status
+          /Applications/Tailscale.app/Contents/MacOS/Tailscale status
+
+      - name: Verify Remote Access
+        run: |
+          echo "Checking remote access services..."
+          
+          # Check Screen Sharing
+          if sudo launchctl list | grep screensharing; then
+              echo "✓ Screen Sharing is running"
+          else
+              echo "✗ Screen Sharing is NOT running"
+          fi
+          
+          # Check SSH
+          if sudo launchctl list | grep ssh; then
+              echo "✓ SSH is running"
+          else
+              echo "✗ SSH is NOT running"
+          fi
+          
+          # Test VNC port dengan netcat
+          echo "Testing VNC port 5900..."
+          echo "QUIT" | nc -w 3 localhost 5900 && echo "✓ VNC port accessible" || echo "✗ VNC port not accessible"
+          
+          # Test SSH port
+          echo "Testing SSH port 22..."
+          nc -zv -w 3 localhost 22 && echo "✓ SSH port accessible" || echo "✗ SSH port not accessible"
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════════╗"
+          echo "║        REMOTE ACCESS INFORMATION          ║"
+          echo "╠════════════════════════════════════════════╣"
+          echo "║ Connection Method: VNC + SSH              ║"
+          echo "║ Tailscale IP: ${TAILSCALE_IP}              ║"
+          echo "║ Username: ${RDP_USERNAME}                  ║"
+          echo "║ Password: ${RDP_PASSWORD}                  ║"
+          echo "╠════════════════════════════════════════════╣"
+          echo "║ VNC: ${TAILSCALE_IP}:5900                  ║"
+          echo "║ SSH: ssh ${RDP_USERNAME}@${TAILSCALE_IP}    ║"
+          echo "╚════════════════════════════════════════════╝"
+          echo ""
+          echo "Connect via Tailscale network from your device"
+          echo ""
+          
+          # Keep connection alive
+          counter=0
+          while true; do
+              counter=$((counter + 1))
+              echo "[$(date '+%Y-%m-%d %H:%M:%S')] Connection Active - ${counter} minutes elapsed"
+              
+              # Periksa koneksi Tailscale setiap 5 menit
+              if [ $((counter % 5)) -eq 0 ]; then
+                  currentIP=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 2>/dev/null)
+                  if [ "$currentIP" != "$TAILSCALE_IP" ]; then
+                      echo "WARNING: Tailscale IP changed to ${currentIP}"
+                  fi
+              fi
+              
+              sleep 60
+          done
